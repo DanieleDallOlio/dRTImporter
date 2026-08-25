@@ -4,8 +4,12 @@ set(MODULE_NAME dRTImporter)
 #-----------------------------------------------------------------------------
 set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}.py
-  ${MODULE_NAME}Plugin.py
-  dRTExporter.py
+  dRTImporterLib/__init__.py
+  dRTImporterLib/dRTImporterPlugin.py
+  dRTImporterLib/dRTExporter.py
+)
+
+set(MODULE_PYTHON_RESOURCES
 )
 
 set(MODULE_PYTHON_RESOURCES

@@ -22,7 +22,7 @@ class dRTImporter:
     )
     parent.hidden = True
 
-    from dRTImporterPlugin import dRTImporterPluginClass
+    from dRTImporterLib.dRTImporterPlugin import dRTImporterPluginClass
 
     try:
       slicer.modules.dicomPlugins

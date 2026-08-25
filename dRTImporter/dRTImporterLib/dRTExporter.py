@@ -1202,6 +1202,14 @@ def export_dynamic_rtstruct(
   extraction_start = time.perf_counter()
 
   for frame_index in range(pet_frame_count):
+    # Publish the frame being processed before its work starts. This makes the
+    # final 66/66 state visible instead of flashing directly from 65/66 to the
+    # assembly phase when the last frame is fast.
+    frame_start_percent = 5 + int(round(55.0 * frame_index / pet_frame_count))
+    report(
+      frame_start_percent,
+      f'Extracting unique contours: frame {frame_index + 1}/{pet_frame_count}')
+
     index_value = pet_sequence_node.GetNthIndexValue(frame_index)
     frame_segmentation = segmentation_sequence_node.GetDataNodeAtValue(
       index_value, True)
@@ -1232,9 +1240,6 @@ def export_dynamic_rtstruct(
           state = {'contours': contours, 'frames': []}
           temporal_geometries[segment_id][signature] = state
         state['frames'].append(frame_index)
-
-    percent = 5 + int(round(55.0 * (frame_index + 1) / pet_frame_count))
-    report(percent, f'Extracting unique contours: frame {frame_index + 1}/{pet_frame_count}')
 
   # Explicitly publish the terminal frame count before moving to the next
   # phase.  On fast final frames Qt could repaint directly from 65/66 to the

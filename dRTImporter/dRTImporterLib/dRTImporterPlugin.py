@@ -510,17 +510,13 @@ class dRTImporterPluginClass(DICOMPlugin):
       planarName,
       stateSignatureBySegment=None,
       closedSurfaceCache=None):
-    """Create Closed surface using Slicer's normal segmentation conversion.
+    """Create or safely reuse Closed surface for one complete temporal state.
 
-    The previous implementation called CreateRepresentationForOneSegment and
-    cached its returned vtkPolyData across temporal states.  Although each
-    attached object was deep-copied, that extra cache/one-segment path is not
-    needed and makes ROI identity harder to audit.  Here we deliberately mirror
-    a conventional SlicerRT segmentation: all Planar contours are present first,
-    then vtkSegmentation converts the complete segmentation to Closed surface.
-
-    Planar contours remains the source representation.  The optional cache
-    arguments are retained for call compatibility but are intentionally unused.
+    Correctness comes first: a cache key represents the complete set of ROI
+    planar geometries in a frame, never one ROI in isolation. On a cache miss
+    Slicer performs its normal whole-segmentation Planar->Closed conversion.
+    On a hit, every cached vtkPolyData is DeepCopy-ed into the new frame, so no
+    mutable representation object is shared between ROIs or sequence items.
     """
     import vtkSegmentationCorePython as vtkSegmentationCore
 
@@ -528,6 +524,16 @@ class dRTImporterPluginClass(DICOMPlugin):
     closedName = (
       vtkSegmentationCore.vtkSegmentationConverter
       .GetSegmentationClosedSurfaceRepresentationName())
+
+    segmentIds = dRTImporterPluginClass._segmentIDs(segmentation)
+    cacheFrames = None
+    cacheKey = None
+    if isinstance(closedSurfaceCache, dict):
+      cacheFrames = closedSurfaceCache.setdefault('frames', {})
+      if stateSignatureBySegment:
+        cacheKey = tuple(
+          (segmentId, str(stateSignatureBySegment.get(segmentId, '')))
+          for segmentId in segmentIds)
 
     # Capture planar identity before conversion.
     planarSignatures = {}
@@ -541,11 +547,30 @@ class dRTImporterPluginClass(DICOMPlugin):
         planar.GetBounds(bounds)
       planarBounds[segmentId] = [round(float(v), 5) for v in bounds]
 
-    # This is the same high-level conversion path used by normal segmentation
-    # workflows.  It lets vtkSegmentation/SlicerRT conversion rules process each
-    # segment independently without any cross-ROI Python cache.
-    if not segmentationNode.CreateClosedSurfaceRepresentation():
-      raise RuntimeError('Failed to create Closed surface representations.')
+    cachedClosedBySegment = (
+      cacheFrames.get(cacheKey) if cacheFrames is not None and cacheKey is not None
+      else None)
+    cacheHit = cachedClosedBySegment is not None
+
+    if cacheHit:
+      # Reuse only a complete previously validated frame state. Each target gets
+      # its own vtkPolyData instance to stay safe with sequence proxy shallow-copy.
+      for segmentId in segmentIds:
+        segment = segmentation.GetSegment(segmentId)
+        sourceClosed = cachedClosedBySegment.get(segmentId)
+        closedCopy = vtk.vtkPolyData()
+        if sourceClosed is not None:
+          closedCopy.DeepCopy(sourceClosed)
+        closedCopy.Modified()
+        segment.AddRepresentation(closedName, closedCopy)
+      closedSurfaceCache['hits'] = int(closedSurfaceCache.get('hits', 0)) + 1
+    else:
+      # Normal Slicer whole-segmentation conversion on each genuinely new full
+      # temporal geometry state. This is the expensive ~1-2 s operation.
+      if not segmentationNode.CreateClosedSurfaceRepresentation():
+        raise RuntimeError('Failed to create Closed surface representations.')
+      if isinstance(closedSurfaceCache, dict):
+        closedSurfaceCache['misses'] = int(closedSurfaceCache.get('misses', 0)) + 1
 
     closedSignatures = {}
     closedBounds = {}
@@ -565,7 +590,6 @@ class dRTImporterPluginClass(DICOMPlugin):
     # A conversion must never make two geometrically distinct planar ROIs become
     # the exact same non-empty closed surface.  Stop immediately if that happens
     # instead of silently displaying the wrong anatomy.
-    segmentIds = dRTImporterPluginClass._segmentIDs(segmentation)
     for firstIndex in range(len(segmentIds)):
       firstId = segmentIds[firstIndex]
       for secondIndex in range(firstIndex + 1, len(segmentIds)):
@@ -584,6 +608,20 @@ class dRTImporterPluginClass(DICOMPlugin):
             f'{secondId} planarBounds={planarBounds[secondId]}, '
             f'closedBounds={closedBounds[firstId]}.')
 
+    if (not cacheHit and cacheFrames is not None and cacheKey is not None):
+      cachedFrame = {}
+      for segmentId in segmentIds:
+        closed = vtk.vtkPolyData.SafeDownCast(
+          segmentation.GetSegment(segmentId).GetRepresentation(closedName))
+        closedCopy = vtk.vtkPolyData()
+        if closed is not None:
+          closedCopy.DeepCopy(closed)
+        closedCopy.Modified()
+        cachedFrame[segmentId] = closedCopy
+      cacheFrames[cacheKey] = cachedFrame
+
+    segmentationNode.SetAttribute(
+      'dRTImporter.ClosedSurfaceCacheHit', '1' if cacheHit else '0')
     segmentationNode.SetAttribute('dRTImporter.ClosedSurfaceReady', '1')
     segmentationNode.SetAttribute(
       'dRTImporter.PlanarGeometrySignatures',
@@ -840,12 +878,13 @@ class dRTImporterPluginClass(DICOMPlugin):
         raise RuntimeError('Dynamic RTSTRUCT import was cancelled.')
 
       polyDataCache = {}
-      closedSurfaceCache = None
+      # Safe full-frame cache: only complete ROI state sets are reused and all
+      # vtkPolyData objects are DeepCopy-ed into each temporal sequence item.
+      closedSurfaceCache = {'frames': {}, 'hits': 0, 'misses': 0}
       for itemIndex, frameNumber in enumerate(frameNumbers):
         progress.value = 10 + int(round(80.0 * (itemIndex + 1) / max(1, len(frameNumbers))))
         progress.labelText = (
-          f'Building dRT frame {itemIndex + 1}/{len(frameNumbers)} ' \
-          '(including Closed surface)')
+          f'Building dRT frame {itemIndex + 1}/{len(frameNumbers)}')
         slicer.app.processEvents()
         if progress.wasCanceled:
           raise RuntimeError('Dynamic RTSTRUCT import was cancelled.')
@@ -941,7 +980,10 @@ class dRTImporterPluginClass(DICOMPlugin):
         len(frameNumbers), len(roiDefinitions), len(contourRecords),
         len(polyDataCache))
       logging.info(
-        '[dRTImporter] Closed-surface conversion uses standard per-frame segmentation conversion (no cross-ROI cache).')
+        '[dRTImporter] Closed-surface full-frame cache: hits=%d misses=%d unique states=%d',
+        int(closedSurfaceCache.get('hits', 0)),
+        int(closedSurfaceCache.get('misses', 0)),
+        len(closedSurfaceCache.get('frames', {})))
       return segmentationSequence
 
     except Exception as error:

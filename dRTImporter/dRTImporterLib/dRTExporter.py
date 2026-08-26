@@ -1,6 +1,10 @@
-"""Fast dynamic RT Structure Set exporter for SlicerDynamicPET.
+"""RT Structure Set exporters for SlicerDynamicPET.
 
-This exporter runs inside 3D Slicer. It reads the binary labelmap representation
+This module runs inside 3D Slicer. It preserves the existing compact temporal
+RTSTRUCT path for dynamic PET and also provides a conventional non-temporal
+RTSTRUCT path for static PET acquisitions.
+
+The dynamic exporter reads the binary labelmap representation
 of each temporal segment directly, extracts planar contours with VTK marching
 squares, converts Slicer RAS coordinates to DICOM LPS coordinates, and writes
 one temporal RTSTRUCT with pydicom.
@@ -1123,6 +1127,562 @@ def _format_frame_ranges(zero_based_frames):
   return ','.join(ranges)
 
 
+
+
+def _dataset_vector(dataset, keyword, expected_length=None):
+  value = getattr(dataset, keyword, None)
+  if value in (None, ''):
+    return None
+  try:
+    values = [float(item) for item in value]
+    if expected_length is not None and len(values) != expected_length:
+      return None
+    return values
+  except Exception:
+    return None
+
+
+def _enhanced_frame_plane(dataset, frame_index):
+  """Return (position, orientation) for one enhanced-image spatial frame."""
+  position = None
+  orientation = None
+  try:
+    frame_group = dataset.PerFrameFunctionalGroupsSequence[frame_index]
+    try:
+      position = [float(v) for v in frame_group.PlanePositionSequence[0].ImagePositionPatient]
+    except Exception:
+      pass
+    try:
+      orientation = [float(v) for v in frame_group.PlaneOrientationSequence[0].ImageOrientationPatient]
+    except Exception:
+      pass
+  except Exception:
+    pass
+  if orientation is None:
+    try:
+      shared = dataset.SharedFunctionalGroupsSequence[0]
+      orientation = [float(v) for v in shared.PlaneOrientationSequence[0].ImageOrientationPatient]
+    except Exception:
+      orientation = _dataset_vector(dataset, 'ImageOrientationPatient', 6)
+  if position is None:
+    position = _dataset_vector(dataset, 'ImagePositionPatient', 3)
+  if position is not None and len(position) != 3:
+    position = None
+  if orientation is not None and len(orientation) != 6:
+    orientation = None
+  return position, orientation
+
+
+def _plane_candidate(instance, position, orientation, referenced_frame_number=None):
+  candidate = {
+    'sopInstanceUID': str(instance['sopInstanceUID']),
+    'sopClassUID': str(instance['sopClassUID']),
+  }
+  if referenced_frame_number is not None:
+    candidate['referencedFrameNumber'] = int(referenced_frame_number)
+  if position is not None:
+    candidate['imagePositionPatient'] = [float(v) for v in position]
+  if orientation is not None:
+    candidate['imageOrientationPatient'] = [float(v) for v in orientation]
+  return candidate
+
+
+def _static_pet_reference_metadata(reference_volume_node):
+  """Resolve conventional static PET DICOM provenance from the MRML volume.
+
+  Classic multi-instance PET is represented by one candidate per source slice.
+  Enhanced multi-frame PET is represented by one candidate per spatial frame,
+  all sharing the same SOP Instance UID and carrying their real DICOM frame
+  number. This frame number is spatial, not the dynamic temporal convention
+  used by export_dynamic_rtstruct().
+  """
+  import pydicom
+  import slicer
+
+  if reference_volume_node is None:
+    raise ValueError('reference_volume_node is required for static RTSTRUCT export.')
+
+  instance_uids = (reference_volume_node.GetAttribute('DICOM.instanceUIDs') or '').split()
+  if not instance_uids:
+    raise ValueError(
+      'The static PET volume does not expose DICOM.instanceUIDs. '
+      'Load the acquisition from the Slicer DICOM database before exporting RTSTRUCT.')
+
+  db = getattr(slicer, 'dicomDatabase', None)
+  if db is None:
+    raise ValueError('Slicer DICOM database is unavailable.')
+
+  first_dataset = None
+  candidates = []
+  seen = set()
+  for uid in instance_uids:
+    file_path = db.fileForInstance(uid)
+    if not file_path or not os.path.isfile(file_path):
+      raise ValueError(
+        f'Cannot resolve source DICOM file for PET SOP Instance UID {uid}.')
+    dataset = pydicom.dcmread(file_path, stop_before_pixels=True, force=True)
+    if first_dataset is None:
+      first_dataset = dataset
+    sop_uid = str(getattr(dataset, 'SOPInstanceUID', '') or uid)
+    sop_class = str(getattr(dataset, 'SOPClassUID', '') or '')
+    if not sop_uid or not sop_class:
+      raise ValueError('Static PET DICOM source has incomplete SOP identity.')
+    base_instance = {'sopInstanceUID': sop_uid, 'sopClassUID': sop_class}
+
+    number_of_frames = int(getattr(dataset, 'NumberOfFrames', 1) or 1)
+    if number_of_frames > 1:
+      for frame_index in range(number_of_frames):
+        position, orientation = _enhanced_frame_plane(dataset, frame_index)
+        key = (sop_uid, frame_index + 1)
+        if key in seen:
+          continue
+        seen.add(key)
+        candidates.append(_plane_candidate(
+          base_instance, position, orientation, frame_index + 1))
+    else:
+      key = (sop_uid, None)
+      if key in seen:
+        continue
+      seen.add(key)
+      candidates.append(_plane_candidate(
+        base_instance,
+        _dataset_vector(dataset, 'ImagePositionPatient', 3),
+        _dataset_vector(dataset, 'ImageOrientationPatient', 6),
+        None))
+
+  if first_dataset is None or not candidates:
+    raise ValueError('No usable DICOM source instances were found for the static PET volume.')
+
+  study_uid = str(getattr(first_dataset, 'StudyInstanceUID', '') or '')
+  series_uid = str(getattr(first_dataset, 'SeriesInstanceUID', '') or '')
+  frame_uid = str(getattr(first_dataset, 'FrameOfReferenceUID', '') or '')
+  if not study_uid or not series_uid or not frame_uid:
+    raise ValueError(
+      'Static PET DICOM provenance is missing StudyInstanceUID, SeriesInstanceUID, '
+      'or FrameOfReferenceUID.')
+
+  patient_study = {}
+  for keyword in (
+      'SpecificCharacterSet', 'PatientName', 'PatientID', 'PatientBirthDate',
+      'PatientSex', 'PatientAge', 'PatientSize', 'PatientWeight', 'StudyDate',
+      'StudyTime', 'AccessionNumber', 'StudyID', 'ReferringPhysicianName',
+      'InstitutionName', 'InstitutionAddress', 'PerformingPhysicianName'):
+    if hasattr(first_dataset, keyword):
+      value = getattr(first_dataset, keyword)
+      if value not in (None, ''):
+        patient_study[keyword] = str(value)
+
+  return {
+    'studyInstanceUID': study_uid,
+    'seriesInstanceUID': series_uid,
+    'frameOfReferenceUID': frame_uid,
+    'patientStudy': patient_study,
+    'instances': candidates,
+  }
+
+
+def _static_segment_definitions(segmentation_node):
+  definitions = {}
+  for segment_id in _segment_ids(segmentation_node):
+    segment = segmentation_node.GetSegmentation().GetSegment(segment_id)
+    if segment is None:
+      continue
+    definitions[segment_id] = {
+      'id': segment_id,
+      'name': segment.GetName(),
+      'color': tuple(float(value) for value in segment.GetColor()),
+    }
+  return definitions
+
+
+def _static_plane_candidates(metadata):
+  cached = metadata.get('_planeCandidates')
+  if cached is not None:
+    return cached
+  candidates = []
+  for instance in metadata.get('instances') or []:
+    position = instance.get('imagePositionPatient')
+    orientation = instance.get('imageOrientationPatient')
+    if not position or not orientation or len(position) != 3 or len(orientation) != 6:
+      continue
+    row = [float(value) for value in orientation[:3]]
+    column = [float(value) for value in orientation[3:]]
+    normal = [
+      row[1] * column[2] - row[2] * column[1],
+      row[2] * column[0] - row[0] * column[2],
+      row[0] * column[1] - row[1] * column[0],
+    ]
+    norm = math.sqrt(sum(value * value for value in normal))
+    if norm <= 1e-12:
+      continue
+    normal = [value / norm for value in normal]
+    candidates.append((instance, [float(value) for value in position], normal))
+  metadata['_planeCandidates'] = candidates
+  return candidates
+
+
+def _reference_instance_for_static_contour(metadata, points_lps):
+  instances = metadata.get('instances') or []
+  if not instances:
+    raise RuntimeError('Static PET acquisition has no source SOP instances.')
+  candidates = _static_plane_candidates(metadata)
+  if not candidates:
+    # A true one-frame 3D SOP may not expose a meaningful slice plane in the
+    # header. It is still a unique image reference for all contours.
+    if len(instances) == 1:
+      return instances[0]
+    raise RuntimeError(
+      'Static PET DICOM instances lack ImagePositionPatient / '
+      'ImageOrientationPatient metadata required to map contours to slices.')
+
+  point = points_lps[0]
+  best = None
+  best_distance = None
+  for instance, position, normal in candidates:
+    distance = abs(sum(
+      (float(point[index]) - position[index]) * normal[index]
+      for index in range(3)))
+    if best_distance is None or distance < best_distance:
+      best = instance
+      best_distance = distance
+  return best
+
+
+def _append_image_reference(sequence, source_instance):
+  from pydicom.dataset import Dataset
+
+  image_reference = Dataset()
+  image_reference.ReferencedSOPClassUID = str(source_instance['sopClassUID'])
+  image_reference.ReferencedSOPInstanceUID = str(source_instance['sopInstanceUID'])
+  frame_number = source_instance.get('referencedFrameNumber')
+  if frame_number is not None:
+    image_reference.ReferencedFrameNumber = int(frame_number)
+  sequence.append(image_reference)
+
+
+def _new_static_rtstruct_dataset(pet_metadata, series_description, series_number, structure_set_label):
+  """Create a conventional, non-temporal RT Structure Set."""
+  from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+  from pydicom.sequence import Sequence
+  from pydicom.uid import ExplicitVRLittleEndian, PYDICOM_IMPLEMENTATION_UID, generate_uid
+
+  now = datetime.now()
+  sop_instance_uid = generate_uid()
+  file_meta = FileMetaDataset()
+  file_meta.FileMetaInformationVersion = b'\x00\x01'
+  file_meta.MediaStorageSOPClassUID = RTSTRUCT_SOP_CLASS_UID
+  file_meta.MediaStorageSOPInstanceUID = sop_instance_uid
+  file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+  file_meta.ImplementationClassUID = PYDICOM_IMPLEMENTATION_UID
+
+  rtstruct = FileDataset('', {}, file_meta=file_meta, preamble=b'\0' * 128)
+  patient_study = pet_metadata.get('patientStudy') or {}
+  rtstruct.SpecificCharacterSet = patient_study.get('SpecificCharacterSet') or 'ISO_IR 192'
+  rtstruct.SOPClassUID = RTSTRUCT_SOP_CLASS_UID
+  rtstruct.SOPInstanceUID = sop_instance_uid
+  rtstruct.Modality = 'RTSTRUCT'
+
+  for keyword, default_value in {
+      'PatientName': '', 'PatientID': '', 'PatientBirthDate': '',
+      'PatientSex': '', 'StudyDate': '', 'StudyTime': '',
+      'ReferringPhysicianName': '', 'StudyID': '', 'AccessionNumber': '',
+      'OperatorsName': ''}.items():
+    value = patient_study.get(keyword)
+    setattr(rtstruct, keyword, default_value if value in (None, '') else value)
+  for keyword in (
+      'PatientAge', 'PatientSize', 'PatientWeight', 'InstitutionName',
+      'InstitutionAddress', 'PerformingPhysicianName'):
+    value = patient_study.get(keyword)
+    if value not in (None, ''):
+      setattr(rtstruct, keyword, value)
+
+  rtstruct.StudyInstanceUID = str(pet_metadata['studyInstanceUID'])
+  rtstruct.SeriesInstanceUID = generate_uid()
+  rtstruct.SeriesNumber = int(series_number)
+  rtstruct.InstanceNumber = 1
+  rtstruct.SeriesDescription = str(series_description)
+  rtstruct.SeriesDate = now.strftime('%Y%m%d')
+  rtstruct.SeriesTime = now.strftime('%H%M%S.%f')
+  rtstruct.StructureSetLabel = str(structure_set_label)[:16]
+  rtstruct.StructureSetName = str(series_description)
+  rtstruct.StructureSetDescription = (
+    'Static RTSTRUCT generated by 3D Slicer / SlicerDynamicPET')
+  rtstruct.StructureSetDate = now.strftime('%Y%m%d')
+  rtstruct.StructureSetTime = now.strftime('%H%M%S.%f')
+  rtstruct.InstanceCreationDate = now.strftime('%Y%m%d')
+  rtstruct.InstanceCreationTime = now.strftime('%H%M%S.%f')
+  rtstruct.Manufacturer = '3D Slicer'
+  rtstruct.ManufacturerModelName = 'SlicerDynamicPET'
+  try:
+    import slicer
+    rtstruct.SoftwareVersions = str(getattr(slicer.app, 'applicationVersion', ''))
+  except Exception:
+    pass
+  rtstruct.ApprovalStatus = 'UNAPPROVED'
+
+  referenced_frame = Dataset()
+  referenced_frame.FrameOfReferenceUID = str(pet_metadata['frameOfReferenceUID'])
+  referenced_study = Dataset()
+  referenced_study.ReferencedSOPClassUID = RT_REFERENCED_STUDY_SOP_CLASS_UID
+  referenced_study.ReferencedSOPInstanceUID = str(pet_metadata['studyInstanceUID'])
+  referenced_series = Dataset()
+  referenced_series.SeriesInstanceUID = str(pet_metadata['seriesInstanceUID'])
+  referenced_series.ContourImageSequence = Sequence([])
+
+  seen = set()
+  for instance in pet_metadata.get('instances') or []:
+    key = (str(instance['sopInstanceUID']), instance.get('referencedFrameNumber'))
+    if key in seen:
+      continue
+    seen.add(key)
+    _append_image_reference(referenced_series.ContourImageSequence, instance)
+
+  referenced_study.RTReferencedSeriesSequence = Sequence([referenced_series])
+  referenced_frame.RTReferencedStudySequence = Sequence([referenced_study])
+  rtstruct.ReferencedFrameOfReferenceSequence = Sequence([referenced_frame])
+  rtstruct.StructureSetROISequence = Sequence([])
+  rtstruct.ROIContourSequence = Sequence([])
+  rtstruct.RTROIObservationsSequence = Sequence([])
+  return rtstruct
+
+
+def _append_static_roi(rtstruct, roi_number, definition, contours, pet_metadata):
+  from pydicom.dataset import Dataset
+  from pydicom.sequence import Sequence
+
+  if not contours:
+    return False
+
+  structure_set_roi = Dataset()
+  structure_set_roi.ROINumber = int(roi_number)
+  structure_set_roi.ReferencedFrameOfReferenceUID = str(
+    pet_metadata['frameOfReferenceUID'])
+  structure_set_roi.ROIName = str(definition['name'])
+  structure_set_roi.ROIDescription = 'SlicerDynamicPET static ROI'
+  structure_set_roi.ROIGenerationAlgorithm = 'MANUAL'
+  rtstruct.StructureSetROISequence.append(structure_set_roi)
+
+  roi_contour = Dataset()
+  roi_contour.ReferencedROINumber = int(roi_number)
+  roi_contour.ROIDisplayColor = [
+    int(round(255.0 * max(0.0, min(1.0, component))))
+    for component in definition['color']]
+  roi_contour.ContourSequence = Sequence([])
+
+  for points_lps in contours:
+    if len(points_lps) < 3:
+      continue
+    contour = Dataset()
+    contour.ContourGeometricType = 'CLOSED_PLANAR'
+    contour.NumberOfContourPoints = len(points_lps)
+    flattened = []
+    for point in points_lps:
+      flattened.extend(round(float(value), 5) for value in point)
+    contour.ContourData = flattened
+    contour.ContourImageSequence = Sequence([])
+    source_instance = _reference_instance_for_static_contour(
+      pet_metadata, points_lps)
+    _append_image_reference(contour.ContourImageSequence, source_instance)
+    roi_contour.ContourSequence.append(contour)
+
+  if not roi_contour.ContourSequence:
+    rtstruct.StructureSetROISequence.pop()
+    return False
+
+  rtstruct.ROIContourSequence.append(roi_contour)
+  observation = Dataset()
+  observation.ObservationNumber = int(roi_number)
+  observation.ReferencedROINumber = int(roi_number)
+  observation.RTROIInterpretedType = ''
+  observation.ROIInterpreter = ''
+  rtstruct.RTROIObservationsSequence.append(observation)
+  return True
+
+
+def _validate_static_rtstruct_in_memory(rtstruct, pet_metadata):
+  if str(getattr(rtstruct, 'SOPClassUID', '')) != RTSTRUCT_SOP_CLASS_UID:
+    raise RuntimeError('Generated object is not an RT Structure Set.')
+
+  allowed = {
+    (str(instance['sopInstanceUID']), instance.get('referencedFrameNumber'))
+    for instance in pet_metadata.get('instances') or []}
+  contour_count = 0
+  for roi_contour in getattr(rtstruct, 'ROIContourSequence', []):
+    for contour in getattr(roi_contour, 'ContourSequence', []):
+      contour_count += 1
+      if str(getattr(contour, 'ContourGeometricType', '')) != 'CLOSED_PLANAR':
+        raise RuntimeError('Generated static contour is not CLOSED_PLANAR.')
+      point_count = int(getattr(contour, 'NumberOfContourPoints', 0))
+      if point_count < 3 or len(getattr(contour, 'ContourData', [])) != 3 * point_count:
+        raise RuntimeError('Generated static contour has invalid point data.')
+      references = getattr(contour, 'ContourImageSequence', [])
+      if len(references) != 1:
+        raise RuntimeError('Generated static contour must reference exactly one PET image plane.')
+      reference = references[0]
+      frame_number = getattr(reference, 'ReferencedFrameNumber', None)
+      key = (
+        str(reference.ReferencedSOPInstanceUID),
+        int(frame_number) if frame_number is not None else None)
+      if key not in allowed:
+        raise RuntimeError('Generated static contour references an unknown PET SOP/frame.')
+  if contour_count == 0:
+    raise RuntimeError('Generated static RTSTRUCT contains no ROI contours.')
+  return contour_count
+
+
+def export_static_rtstruct(
+    segmentation_node,
+    reference_volume_node,
+    output_path,
+    *,
+    series_description=None,
+    series_number=302,
+    structure_set_label='StaticRT',
+    overwrite=False,
+    progress_callback=None):
+  """Export one conventional RTSTRUCT for one static PET acquisition."""
+  import pydicom
+
+  start_time = time.perf_counter()
+  if segmentation_node is None:
+    raise ValueError('segmentation_node is required.')
+  if reference_volume_node is None:
+    raise ValueError('reference_volume_node is required.')
+  if segmentation_node.GetSegmentation() is None:
+    raise ValueError('The segmentation node contains no segmentation.')
+
+  output_path = os.path.abspath(str(output_path))
+  if not output_path.lower().endswith('.dcm'):
+    output_path += '.dcm'
+  if os.path.exists(output_path) and not overwrite:
+    raise FileExistsError(f'Output already exists: {output_path}')
+
+  def report(percent, text):
+    if progress_callback is None:
+      return
+    if progress_callback(int(percent), 100, text) is False:
+      raise RuntimeError('Static RTSTRUCT export was cancelled.')
+
+  report(0, 'Resolving static PET DICOM metadata')
+  pet_metadata = _static_pet_reference_metadata(reference_volume_node)
+  reference_frame_uid = _reference_frame_of_reference_uid(reference_volume_node)
+  if (reference_frame_uid
+      and str(reference_frame_uid) != str(pet_metadata['frameOfReferenceUID'])):
+    raise ValueError(
+      'The selected static PET volume and its DICOM provenance have different '
+      'Frame of Reference UIDs.')
+
+  report(10, 'Analyzing static segmentation')
+  definitions = _static_segment_definitions(segmentation_node)
+  if not definitions:
+    raise ValueError('No segments are present in the static segmentation.')
+
+  geometries = {}
+  count = max(1, len(definitions))
+  for index, (segment_id, definition) in enumerate(definitions.items()):
+    report(
+      10 + int(round(55.0 * index / count)),
+      f"Extracting contours: {definition['name']} ({index + 1}/{count})")
+    labelmap = _binary_labelmap(segmentation_node, segment_id)
+    if labelmap is None:
+      continue
+    contours = _contours_from_binary_labelmap(labelmap)
+    if contours:
+      geometries[segment_id] = contours
+
+  if not geometries:
+    raise ValueError('No non-empty ROI contours were generated for the static segmentation.')
+
+  if not series_description:
+    series_description = segmentation_node.GetName() or 'SlicerDynamicPET'
+    if not str(series_description).lower().endswith('rtstruct'):
+      series_description = f'{series_description} - RTSTRUCT'
+
+  report(70, 'Building static RTSTRUCT')
+  rtstruct = _new_static_rtstruct_dataset(
+    pet_metadata,
+    series_description=series_description,
+    series_number=series_number,
+    structure_set_label=structure_set_label)
+
+  exported_roi_number = 0
+  for segment_id, definition in definitions.items():
+    contours = geometries.get(segment_id)
+    if not contours:
+      continue
+    proposed_roi_number = exported_roi_number + 1
+    if _append_static_roi(
+        rtstruct, proposed_roi_number, definition, contours, pet_metadata):
+      exported_roi_number = proposed_roi_number
+
+  if exported_roi_number == 0:
+    raise ValueError('No non-empty ROI contours were generated.')
+
+  contour_count = _validate_static_rtstruct_in_memory(rtstruct, pet_metadata)
+  report(88, 'Writing static RTSTRUCT DICOM')
+  os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+  pydicom.dcmwrite(output_path, rtstruct, enforce_file_format=True)
+  if not os.path.isfile(output_path) or os.path.getsize(output_path) <= 132:
+    raise RuntimeError('Static RTSTRUCT write did not create a valid DICOM file.')
+
+  report(100, 'Static RTSTRUCT export complete')
+  logging.info(
+    '[dRTExporter] Static RTSTRUCT complete %.3f s; ROIs=%d contours=%d; size %.2f MB: %s',
+    time.perf_counter() - start_time,
+    exported_roi_number,
+    contour_count,
+    os.path.getsize(output_path) / (1024.0 * 1024.0),
+    output_path)
+  return output_path
+
+
+def export_static_rtstruct_from_node_ids(
+    segmentation_node_id,
+    reference_volume_node_id,
+    output_path,
+    overwrite=False,
+    show_progress=True):
+  """PythonQt-friendly static RTSTRUCT wrapper used by SlicerDynamicPET."""
+  import qt
+  import slicer
+
+  segmentation_node = slicer.mrmlScene.GetNodeByID(str(segmentation_node_id))
+  reference_volume_node = slicer.mrmlScene.GetNodeByID(str(reference_volume_node_id))
+
+  progress = None
+  if show_progress:
+    progress = slicer.util.createProgressDialog(
+      labelText='Preparing static RTSTRUCT export',
+      value=0,
+      maximum=100,
+      windowModality=qt.Qt.WindowModal)
+
+  def progress_callback(value, maximum, label):
+    if progress is None:
+      return True
+    progress.maximum = maximum
+    progress.value = value
+    progress.labelText = label
+    slicer.app.processEvents()
+    return not progress.wasCanceled
+
+  _start_diagnostics()
+  try:
+    _dbg(
+      f'static wrapper nodeIDs seg={segmentation_node_id!r} '
+      f'ref={reference_volume_node_id!r}')
+    return export_static_rtstruct(
+      segmentation_node,
+      reference_volume_node,
+      output_path,
+      overwrite=bool(overwrite),
+      progress_callback=progress_callback)
+  finally:
+    if progress is not None:
+      progress.close()
+    _stop_diagnostics()
+
+
 def export_dynamic_rtstruct(
     segmentation_sequence_node,
     pet_sequence_node,
@@ -1402,4 +1962,6 @@ def export_dynamic_rtstruct_from_node_ids(
 __all__ = [
   'export_dynamic_rtstruct',
   'export_dynamic_rtstruct_from_node_ids',
+  'export_static_rtstruct',
+  'export_static_rtstruct_from_node_ids',
 ]

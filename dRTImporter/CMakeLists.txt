@@ -12,8 +12,6 @@ set(MODULE_PYTHON_SCRIPTS
 set(MODULE_PYTHON_RESOURCES
 )
 
-set(MODULE_PYTHON_RESOURCES
-)
 
 #-----------------------------------------------------------------------------
 slicerMacroBuildScriptedModule(

@@ -8,6 +8,8 @@ import slicer
 import vtk
 
 from DICOMLib import DICOMLoadable, DICOMPlugin
+from dRTImporterLib.dRTEnhancedTemporal import (
+  analyze_enhanced_rtstruct, matches_enhanced_pet_sequence)
 
 
 class dRTImporterPluginClass(DICOMPlugin):
@@ -71,6 +73,10 @@ class dRTImporterPluginClass(DICOMPlugin):
     if (str(getattr(dataset, 'SOPClassUID', '')) != self.RTSTRUCT_SOP_CLASS_UID
         or str(getattr(dataset, 'Modality', '')) != 'RTSTRUCT'):
       return None
+
+    enhanced = analyze_enhanced_rtstruct(dataset)
+    if enhanced is not None:
+      return enhanced
 
     frameToSOPInstanceUIDs = {}
     sopInstanceUIDToFrames = {}
@@ -176,9 +182,15 @@ class dRTImporterPluginClass(DICOMPlugin):
           loadable.name = (
             f"{displayName} [Dynamic RTSTRUCT] "
             f"({len(frameNumbers)} frames)")
-          loadable.tooltip = (
-            "Load as a dynamic segmentation sequence using the one-based "
-            f"temporal Referenced Frame Number convention (1..{frameNumbers[-1]}).")
+          if analysis.get('convention') == 'EnhancedPrivateTemporalMapV1':
+            loadable.tooltip = (
+              "Load DynamicPET Enhanced single-SOP PET temporal contours "
+              f"({len(frameNumbers)} PET volumes). Uses the validated private "
+              "time mapping and actual DICOM source image frame numbers.")
+          else:
+            loadable.tooltip = (
+              "Load as a dynamic segmentation sequence using the one-based "
+              f"temporal Referenced Frame Number convention (1..{frameNumbers[-1]}).")
           loadable.selected = True
           loadable.confidence = 1.0
           loadables.append(loadable)
@@ -294,6 +306,28 @@ class dRTImporterPluginClass(DICOMPlugin):
 
   def _findCompatibleVolumeBrowser(self, analysis):
     """Find the uniquely referenced PET/volume browser without guessing."""
+    if analysis.get('convention') == 'EnhancedPrivateTemporalMapV1':
+      exactMatches = []
+      for browserNode in slicer.util.getNodesByClass('vtkMRMLSequenceBrowserNode'):
+        masterSequence = browserNode.GetMasterSequenceNode()
+        if masterSequence is None:
+          continue
+        first = (masterSequence.GetNthDataNode(0)
+                 if masterSequence.GetNumberOfDataNodes() else None)
+        if first is None or not first.IsA('vtkMRMLScalarVolumeNode'):
+          continue
+        if matches_enhanced_pet_sequence(masterSequence, analysis):
+          exactMatches.append(browserNode)
+      if len(exactMatches) == 1:
+        return exactMatches[0]
+      if len(exactMatches) > 1:
+        logging.warning('[dRTImporter] Multiple browsers match exact Enhanced PET '
+                        'temporal provenance; importing as a standalone sequence.')
+      else:
+        logging.info('[dRTImporter] No loaded PET browser matches the Enhanced '
+                     'SOP/frame provenance; importing as a standalone sequence.')
+      return None
+
     referencedSeriesUID = analysis['referencedSeriesInstanceUID']
     frameNumbers = analysis['frameNumbers']
     expectedSets = [
@@ -377,9 +411,11 @@ class dRTImporterPluginClass(DICOMPlugin):
       })
     return definitions
 
-  def _contoursByROIAndFrame(self, dataset, frameNumbers):
+  def _contoursByROIAndFrame(self, dataset, frameNumbers, analysis=None):
     """Index DICOM contours once without duplicating their coordinate arrays."""
     frameSet = set(int(value) for value in frameNumbers)
+    enhancedReverse = ((analysis or {}).get('sourceFrameNumberToTemporalFrame')
+                       or {})
     indexed = {}
     contourRecords = []
 
@@ -416,8 +452,12 @@ class dRTImporterPluginClass(DICOMPlugin):
 
         contourFrames = set()
         for imageReference in getattr(contour, 'ContourImageSequence', []):
-          for frameNumber in self._asIntList(
+          for sourceNumber in self._asIntList(
               getattr(imageReference, 'ReferencedFrameNumber', None)):
+            # Enhanced DICOM frame numbers are *spatial* source image frames.
+            # The versioned private map assigns them to PET time points.
+            frameNumber = (enhancedReverse[sourceNumber]
+                           if enhancedReverse else sourceNumber)
             if frameNumber in frameSet:
               contourFrames.add(frameNumber)
         if not contourFrames:
@@ -812,12 +852,13 @@ class dRTImporterPluginClass(DICOMPlugin):
       logging.error('[dRTImporter] Dynamic RTSTRUCT contains no ROI definitions.')
       return False
 
+    enhanced = analysis.get('convention') == 'EnhancedPrivateTemporalMapV1'
     volumeBrowser = self._findCompatibleVolumeBrowser(analysis)
     volumeSequence = (
       volumeBrowser.GetMasterSequenceNode() if volumeBrowser else None)
     volumeIndexByUIDSet = (
       self._volumeIndexBySOPInstanceUIDSet(volumeSequence)
-      if volumeSequence else None)
+      if volumeSequence and not enhanced else None)
 
     baseName = self._displayBaseName(sourceDataset)
     segmentationSequence = slicer.mrmlScene.AddNewNodeByClass(
@@ -832,7 +873,7 @@ class dRTImporterPluginClass(DICOMPlugin):
     segmentationSequence.SetAttribute('dRTImporter.DynamicRTStruct', '1')
     segmentationSequence.SetAttribute('dRTImporter.DisplayName', baseName)
     segmentationSequence.SetAttribute(
-      'dRTImporter.Convention', 'TemporalReferencedFrameNumber')
+      'dRTImporter.Convention', analysis.get('convention', 'TemporalReferencedFrameNumber'))
     segmentationSequence.SetAttribute('dRTImporter.SourceFile', sourcePath)
     segmentationSequence.SetAttribute(
       'dRTImporter.SourceRepresentation', 'Planar contours')
@@ -843,6 +884,16 @@ class dRTImporterPluginClass(DICOMPlugin):
       segmentationSequence.SetAttribute(
         'dRTImporter.ReferencedSeriesInstanceUID',
         analysis['referencedSeriesInstanceUID'])
+    if enhanced:
+      segmentationSequence.SetAttribute(
+        'dRTImporter.EnhancedSourceFrameNumbers',
+        json.dumps(analysis['enhancedSourceFrameNumbers'], separators=(',', ':')))
+      segmentationSequence.SetAttribute(
+        'dRTImporter.EnhancedSourceSOPInstanceUID',
+        analysis['enhancedSourceSOPInstanceUID'])
+      segmentationSequence.SetAttribute(
+        'dRTImporter.ReferencedFrameOfReferenceUID',
+        analysis['referencedFrameOfReferenceUID'])
 
     progress = slicer.util.createProgressDialog(
       labelText=f'Reading {baseName}',
@@ -855,7 +906,7 @@ class dRTImporterPluginClass(DICOMPlugin):
       progress.labelText = 'Indexing dynamic RTSTRUCT contours'
       slicer.app.processEvents()
       contoursByROIAndFrame, contourRecords = self._contoursByROIAndFrame(
-        sourceDataset, frameNumbers)
+        sourceDataset, frameNumbers, analysis)
 
       # Summarize temporal geometry states before any VTK conversion. This
       # proves whether an edited ROI state is present in the DICOM object.
@@ -891,14 +942,18 @@ class dRTImporterPluginClass(DICOMPlugin):
 
         referenceVolumeNode = None
         if volumeSequence:
-          referencedUIDSet = frozenset(
-            analysis['frameToSOPInstanceUIDs'][str(frameNumber)])
-          if (volumeIndexByUIDSet is None
-              or referencedUIDSet not in volumeIndexByUIDSet):
-            raise RuntimeError(
-              f'PET SOP Instance UID set for dynamic RT frame {frameNumber} '
-              'cannot be mapped to the selected PET sequence.')
-          volumeItemNumber = volumeIndexByUIDSet[referencedUIDSet]
+          if enhanced:
+            # Frame position was validated against dPETImporter sourceFrameNumbers.
+            volumeItemNumber = frameNumber - 1
+          else:
+            referencedUIDSet = frozenset(
+              analysis['frameToSOPInstanceUIDs'][str(frameNumber)])
+            if (volumeIndexByUIDSet is None
+                or referencedUIDSet not in volumeIndexByUIDSet):
+              raise RuntimeError(
+                f'PET SOP Instance UID set for dynamic RT frame {frameNumber} '
+                'cannot be mapped to the selected PET sequence.')
+            volumeItemNumber = volumeIndexByUIDSet[referencedUIDSet]
           indexValue = volumeSequence.GetNthIndexValue(volumeItemNumber)
           referenceVolumeNode = volumeSequence.GetNthDataNode(volumeItemNumber)
         else:
@@ -949,6 +1004,12 @@ class dRTImporterPluginClass(DICOMPlugin):
         proxySegmentation.SetAttribute(
           'dRTImporter.FrameToSOPInstanceUIDs',
           json.dumps(analysis['frameToSOPInstanceUIDs'], separators=(',', ':')))
+        if enhanced:
+          for key in ('EnhancedSourceFrameNumbers', 'EnhancedSourceSOPInstanceUID',
+                      'ReferencedFrameOfReferenceUID'):
+            proxySegmentation.SetAttribute(
+              'dRTImporter.' + key,
+              segmentationSequence.GetAttribute('dRTImporter.' + key))
         if analysis['referencedSeriesInstanceUID']:
           proxySegmentation.SetAttribute(
             'dRTImporter.ReferencedSeriesInstanceUID',
@@ -1048,22 +1109,46 @@ def adopt_dynamic_rtstruct_to_pet(
       frameMap = json.loads(frameMapJson)
 
     frameNumbers = sorted(int(value) for value in frameMap.keys())
-    referencedSets = [
-      frozenset(frameMap[str(frameNumber)]) for frameNumber in frameNumbers
-    ]
-
-    petUIDSets = dRTImporterPluginClass._sequenceFrameSOPInstanceUIDSets(petSequence)
-    if petUIDSets is None:
-      raise RuntimeError(
-        'The selected PET sequence does not expose source SOP Instance UID '
-        'sets for each temporal frame.')
-    petKeys = [frozenset(uids) for uids in petUIDSets]
-    if (len(petKeys) != len(referencedSets)
-        or set(petKeys) != set(referencedSets)):
-      raise RuntimeError(
-        'The dynamic RTSTRUCT temporal SOP reference sets do not match the '
-        'selected PET sequence.')
-    petIndexByUIDSet = {key: index for index, key in enumerate(petKeys)}
+    enhancedFrameText = sourceSequence.GetAttribute(
+      'dRTImporter.EnhancedSourceFrameNumbers')
+    enhanced = bool(enhancedFrameText)
+    if enhanced:
+      # With a single Enhanced SOP, UID sets are identical for every time point.
+      # Match the *entire* original temporal/spatial source frame map instead.
+      analysis = {
+        'enhancedSourceFrameNumbers': json.loads(enhancedFrameText),
+        'enhancedSourceSOPInstanceUID': sourceSequence.GetAttribute(
+          'dRTImporter.EnhancedSourceSOPInstanceUID'),
+        'referencedSeriesInstanceUID': referencedSeriesUID,
+        'referencedFrameOfReferenceUID': sourceSequence.GetAttribute(
+          'dRTImporter.ReferencedFrameOfReferenceUID'),
+      }
+      if (len(frameNumbers) != len(analysis['enhancedSourceFrameNumbers'])
+          or frameNumbers != list(range(1, len(frameNumbers) + 1))
+          or not matches_enhanced_pet_sequence(petSequence, analysis)):
+        raise RuntimeError(
+          'Enhanced RTSTRUCT source SOP/frame-number mapping does not match '
+          'the selected dynamic PET sequence.')
+      browserMaster = petBrowser.GetMasterSequenceNode()
+      if (browserMaster is None or browserMaster.GetID() != petSequence.GetID()):
+        raise RuntimeError('Selected PET browser does not own the requested PET sequence.')
+      petIndexByUIDSet = None
+    else:
+      referencedSets = [
+        frozenset(frameMap[str(frameNumber)]) for frameNumber in frameNumbers
+      ]
+      petUIDSets = dRTImporterPluginClass._sequenceFrameSOPInstanceUIDSets(petSequence)
+      if petUIDSets is None:
+        raise RuntimeError(
+          'The selected PET sequence does not expose source SOP Instance UID '
+          'sets for each temporal frame.')
+      petKeys = [frozenset(uids) for uids in petUIDSets]
+      if (len(petKeys) != len(referencedSets)
+          or set(petKeys) != set(referencedSets)):
+        raise RuntimeError(
+          'The dynamic RTSTRUCT temporal SOP reference sets do not match the '
+          'selected PET sequence.')
+      petIndexByUIDSet = {key: index for index, key in enumerate(petKeys)}
 
     sourceNodeByFrame = {}
     for itemIndex in range(sourceSequence.GetNumberOfDataNodes()):
@@ -1092,14 +1177,20 @@ def adopt_dynamic_rtstruct_to_pet(
         'dRTImporter.SourceFile',
         'dRTImporter.FrameToSOPInstanceUIDs',
         'dRTImporter.FrameToSOPInstanceUID',
-        'dRTImporter.ReferencedSeriesInstanceUID'):
+        'dRTImporter.ReferencedSeriesInstanceUID',
+        'dRTImporter.EnhancedSourceFrameNumbers',
+        'dRTImporter.EnhancedSourceSOPInstanceUID',
+        'dRTImporter.ReferencedFrameOfReferenceUID'):
       value = sourceSequence.GetAttribute(attributeName)
       if value is not None:
         alignedSequence.SetAttribute(attributeName, value)
 
     for frameNumber in frameNumbers:
-      referencedUIDSet = frozenset(frameMap[str(frameNumber)])
-      petItemIndex = petIndexByUIDSet[referencedUIDSet]
+      if enhanced:
+        petItemIndex = frameNumber - 1
+      else:
+        referencedUIDSet = frozenset(frameMap[str(frameNumber)])
+        petItemIndex = petIndexByUIDSet[referencedUIDSet]
       indexValue = petSequence.GetNthIndexValue(petItemIndex)
       sourceNode = sourceNodeByFrame[frameNumber]
       petFrameNode = petSequence.GetNthDataNode(petItemIndex)

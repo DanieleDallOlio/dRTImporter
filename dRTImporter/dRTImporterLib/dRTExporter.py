@@ -126,6 +126,13 @@ def _parse_dicom_vector(value, expected_length=None):
     return None
 
 
+def _is_single_sop_enhanced(metadata):
+  frames = metadata.get('frames') or []
+  return (bool(frames) and all(
+    frame.get('spatialMapping') == 'SINGLE_SOP_ENHANCED_FRAMES'
+    for frame in frames))
+
+
 def _validate_pet_reference_metadata(metadata, expected_count, require_enhanced_pet=False):
   if not isinstance(metadata, dict):
     raise ValueError('PET DICOM provenance is not a dictionary.')
@@ -137,21 +144,54 @@ def _validate_pet_reference_metadata(metadata, expected_count, require_enhanced_
     if not str(metadata.get(keyword) or ''):
       raise ValueError(f'PET DICOM provenance is missing {keyword}.')
 
+  enhanced = _is_single_sop_enhanced(metadata)
+  if any(f.get('spatialMapping') == 'SINGLE_SOP_ENHANCED_FRAMES' for f in frames) and not enhanced:
+    raise ValueError('Mixed Enhanced single-SOP and conventional PET provenance is unsupported.')
+  if enhanced and int(metadata.get('schemaVersion', 0)) < 2:
+    raise ValueError('Enhanced PET RTSTRUCT requires persisted DICOM provenance schema 2.')
   seen_uids = set()
+  enhanced_uid = None
+  expected_slice_count = None
+  seen_source_frames = set()
   for frame_index, frame in enumerate(frames):
     instances = frame.get('instances') or []
     if not instances:
       raise ValueError(f'PET temporal frame {frame_index + 1} has no source SOP instances.')
+    if enhanced and len(instances) != 1:
+      raise ValueError(f'Enhanced PET temporal frame {frame_index + 1} must have one SOP.')
     for instance in instances:
       uid = str(instance.get('sopInstanceUID') or '')
       sop_class = str(instance.get('sopClassUID') or '')
       if not uid or not sop_class:
         raise ValueError(
           f'PET temporal frame {frame_index + 1} has incomplete SOP identity.')
-      if uid in seen_uids:
-        raise ValueError(
-          'The same PET SOP Instance UID occurs in more than one temporal frame.')
-      seen_uids.add(uid)
+      if enhanced:
+        if sop_class != ENHANCED_PET_IMAGE_STORAGE_UID:
+          raise ValueError('Enhanced PET provenance has an incorrect SOP Class UID.')
+        if enhanced_uid is None:
+          enhanced_uid = uid
+        elif uid != enhanced_uid:
+          raise ValueError('Enhanced PET temporal frames must reference one SOP UID.')
+      else:
+        if uid in seen_uids:
+          raise ValueError(
+            'The same PET SOP Instance UID occurs in more than one temporal frame.')
+        seen_uids.add(uid)
+
+    if enhanced:
+      numbers = frame.get('sourceFrameNumbers')
+      if not isinstance(numbers, list) or not numbers:
+        raise ValueError(f'Enhanced temporal frame {frame_index + 1} lacks sourceFrameNumbers.')
+      if expected_slice_count is None:
+        expected_slice_count = len(numbers)
+      elif len(numbers) != expected_slice_count:
+        raise ValueError('Enhanced PET temporal frames have inconsistent spatial slice counts.')
+      for number in numbers:
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+          raise ValueError('Enhanced PET contains an invalid DICOM source frame number.')
+        if number in seen_source_frames:
+          raise ValueError('Enhanced PET DICOM source frame numbers are not unique.')
+        seen_source_frames.add(number)
 
   if require_enhanced_pet:
     for frame_index, frame in enumerate(frames):
@@ -355,7 +395,15 @@ def _metadata_from_source_files(pet_sequence_node, explicit_files=None):
 def _resolve_pet_reference_metadata(
     pet_sequence_node, explicit_files=None, require_enhanced_pet=False):
   frame_count = pet_sequence_node.GetNumberOfDataNodes()
+  # Enhanced PET already has authoritative source identity and spatial mapping
+  # persisted by dPETImporter. Never replace it with database/header guesses.
+  enhanced_sequence = (
+    pet_sequence_node.GetAttribute('dPET.FrameType') == 'Enhanced-single-instance')
   metadata = _metadata_from_dpet_importer(pet_sequence_node)
+  if enhanced_sequence and metadata is None:
+    raise ValueError(
+      'Enhanced PET RTSTRUCT export requires persisted dPET.DICOM.FrameReferences. '
+      'Re-import the source PET with the current dPETImporter.')
   if metadata is None:
     metadata = _metadata_from_mrml_and_dicom_database(pet_sequence_node)
   if metadata is None:
@@ -367,6 +415,22 @@ def _resolve_pet_reference_metadata(
       'or source DICOM headers when available.')
 
   _validate_pet_reference_metadata(metadata, frame_count, require_enhanced_pet)
+
+  if enhanced_sequence or _is_single_sop_enhanced(metadata):
+    if not _is_single_sop_enhanced(metadata):
+      raise ValueError('Enhanced PET sequence has incompatible DICOM provenance.')
+    patient_study = metadata.get('patientStudy')
+    if not isinstance(patient_study, dict):
+      patient_study = {}
+    missing = [keyword for keyword in ('PatientName', 'PatientID')
+               if not str(patient_study.get(keyword) or '').strip()]
+    if missing:
+      raise ValueError(
+        'Enhanced PET RTSTRUCT export cannot preserve the source patient identity: '
+        + ', '.join(missing) + ' missing from dPET.DICOM.FrameReferences. '
+        'Re-import the original Enhanced PET using the updated dPETImporter, '
+        'or backfill the sequence from its source DICOM header. '
+        'The exporter will not look up patient identity in the DICOM database.')
 
   # Cache successful fallback resolution in the scene so subsequent exports and
   # MRML scene saves no longer depend on the original source files.
@@ -725,6 +789,129 @@ def _copy_if_present(source, destination, keywords):
       setattr(destination, keyword, getattr(source, keyword))
 
 
+def _prepare_enhanced_geometry(pet_metadata, pet_sequence_node, reference_volume_node):
+  """Use the imported PET volume geometry to map planar contours to Slicer K."""
+  import vtk
+
+  first_volume = pet_sequence_node.GetNthDataNode(0)
+  if first_volume is None or not first_volume.IsA('vtkMRMLScalarVolumeNode'):
+    raise ValueError('Enhanced PET source sequence has no scalar volume geometry.')
+  image = first_volume.GetImageData()
+  if image is None:
+    raise ValueError('Enhanced PET source volume has no image data.')
+  slice_count = int(image.GetDimensions()[2])
+  if slice_count < 1 or any(
+      len(frame['sourceFrameNumbers']) != slice_count
+      for frame in pet_metadata['frames']):
+    raise ValueError('Enhanced PET DICOM source-frame mapping does not match the PET K dimension.')
+
+  source_matrix = vtk.vtkMatrix4x4()
+  first_volume.GetIJKToRASMatrix(source_matrix)
+  # The optional reference may be a CT selected by DynamicPET. Its voxel grid
+  # is generally different from PET even when both share a DICOM patient frame.
+  # The separate FrameOfReferenceUID check in export_dynamic_rtstruct() remains
+  # responsible for rejecting incompatible patient coordinate systems.
+  # Segment masks are resampled onto the *PET* grid before contour extraction.
+
+  k_vector = [-source_matrix.GetElement(0, 2),
+              -source_matrix.GetElement(1, 2),
+               source_matrix.GetElement(2, 2)]
+  step = math.sqrt(sum(value * value for value in k_vector))
+  if not math.isfinite(step) or step <= 0:
+    raise ValueError('Enhanced PET has invalid K slice spacing.')
+  normal = [value / step for value in k_vector]
+  origin_ras = source_matrix.MultiplyPoint((0.0, 0.0, 0.0, 1.0))
+  origin_lps = [-float(origin_ras[0]), -float(origin_ras[1]), float(origin_ras[2])]
+  pet_metadata['_enhancedGeometry'] = {
+    'originLPS': origin_lps,
+    'normalLPS': normal,
+    'spacingK': step,
+    'sliceCount': slice_count,
+    'petIJKToRAS': source_matrix,
+    'petExtent': tuple(int(value) for value in image.GetExtent()),
+  }
+
+
+def _resample_binary_labelmap_to_enhanced_pet(labelmap, pet_metadata):
+  """Nearest-neighbor resample the ROI onto the source Enhanced PET voxel grid.
+
+  DynamicPET may use a CT to define segmentation geometry. Contouring CT K
+  planes and pointing those contours at PET spatial frames is not valid unless
+  the plane grids coincide. We instead contour the mask on PET planes. Crop the
+  reference extent to the ROI's PET-space bounds to avoid allocating an entire
+  high-resolution Quadra volume for each ROI and time point.
+  """
+  import vtk
+  import vtkSegmentationCorePython as vtkSegmentationCore
+
+  geometry = pet_metadata.get('_enhancedGeometry')
+  if geometry is None:
+    raise RuntimeError('Enhanced PET reference geometry was not prepared.')
+  pet_matrix = geometry['petIJKToRAS']
+  pet_extent = geometry['petExtent']
+
+  label_matrix = vtk.vtkMatrix4x4()
+  labelmap.GetImageToWorldMatrix(label_matrix)
+  world_to_pet = vtk.vtkMatrix4x4()
+  vtk.vtkMatrix4x4.Invert(pet_matrix, world_to_pet)
+  label_to_pet = vtk.vtkMatrix4x4()
+  vtk.vtkMatrix4x4.Multiply4x4(world_to_pet, label_matrix, label_to_pet)
+
+  source_extent = tuple(int(v) for v in labelmap.GetExtent())
+  pet_bounds = [[], [], []]
+  for i in (source_extent[0], source_extent[1]):
+    for j in (source_extent[2], source_extent[3]):
+      for k in (source_extent[4], source_extent[5]):
+        pet_point = label_to_pet.MultiplyPoint((float(i), float(j), float(k), 1.0))
+        for axis in range(3):
+          pet_bounds[axis].append(float(pet_point[axis]))
+
+  target_extent = []
+  for axis in range(3):
+    low = max(pet_extent[2 * axis], int(math.floor(min(pet_bounds[axis]))) - 2)
+    high = min(pet_extent[2 * axis + 1], int(math.ceil(max(pet_bounds[axis]))) + 2)
+    if low > high:
+      raise ValueError('Segmentation mask is outside the Enhanced PET field of view.')
+    target_extent.extend((low, high))
+
+  reference = vtkSegmentationCore.vtkOrientedImageData()
+  reference.SetExtent(*target_extent)
+  reference.SetImageToWorldMatrix(pet_matrix)
+  resampled = vtkSegmentationCore.vtkOrientedImageData()
+  success = vtkSegmentationCore.vtkOrientedImageDataResample.ResampleOrientedImageToReferenceOrientedImage(
+    labelmap, reference, resampled,
+    False,  # nearest-neighbor: never interpolate binary segment labels
+    False)  # crop to the reference extent: never create off-PET contours
+  if not success:
+    raise RuntimeError('Could not resample the segmentation onto Enhanced PET geometry.')
+  scalars = resampled.GetPointData().GetScalars()
+  if scalars is None or scalars.GetNumberOfTuples() == 0 or scalars.GetRange()[1] <= 0:
+    raise ValueError(
+      'Segmentation has no occupied PET voxels after resampling. '
+      'A very small ROI may disappear at the PET resolution.')
+  return resampled
+
+
+def _enhanced_source_frame_for_contour(pet_metadata, temporal_index, points_lps):
+  """Resolve the true 1-based DICOM frame number for a single planar contour."""
+  geometry = pet_metadata.get('_enhancedGeometry')
+  if geometry is None or len(points_lps) < 3:
+    raise RuntimeError('Enhanced PET contour has no validated source geometry.')
+  normal = geometry['normalLPS']
+  origin = geometry['originLPS']
+  spacing = geometry['spacingK']
+  # Projection works for oblique orientations, not merely axial patient Z.
+  projected = [sum((float(point[i]) - origin[i]) * normal[i]
+                   for i in range(3)) / spacing for point in points_lps]
+  k = int(round(projected[0]))
+  first_k = geometry['petExtent'][4]
+  tolerance = min(0.5, max(0.05, 0.15 * spacing)) / spacing
+  if (k < first_k or k >= first_k + geometry['sliceCount']
+      or any(abs(value - k) > tolerance for value in projected)):
+    raise RuntimeError('A contour plane could not be mapped exactly to an Enhanced PET K slice.')
+  return int(pet_metadata['frames'][temporal_index]['sourceFrameNumbers'][k - first_k])
+
+
 def _new_rtstruct_dataset(pet_metadata, series_description, series_number, structure_set_label):
   """Create a compact RTSTRUCT using persisted PET patient/study provenance."""
   from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
@@ -807,17 +994,37 @@ def _new_rtstruct_dataset(pet_metadata, series_description, series_number, struc
   referenced_series.SeriesInstanceUID = str(pet_metadata['seriesInstanceUID'])
   referenced_series.ContourImageSequence = Sequence([])
 
-  # Complete temporal provenance map. For 3D PET there is one source instance
-  # per temporal frame; for classic 2D PET there are multiple slice instances.
-  # This top-level map is lightweight and also preserves completely empty
-  # temporal segmentation states.
-  for frame_index, frame in enumerate(pet_metadata['frames']):
-    for instance in frame.get('instances') or []:
-      image_reference = Dataset()
-      image_reference.ReferencedSOPClassUID = str(instance['sopClassUID'])
-      image_reference.ReferencedSOPInstanceUID = str(instance['sopInstanceUID'])
-      image_reference.ReferencedFrameNumber = frame_index + 1
-      referenced_series.ContourImageSequence.append(image_reference)
+  if _is_single_sop_enhanced(pet_metadata):
+    # Refer to the Enhanced PET SOP as a whole at series level.  A DICOM frame
+    # number is a *spatial image frame*, never a PET temporal-frame ordinal.
+    first_instance = pet_metadata['frames'][0]['instances'][0]
+    image_reference = Dataset()
+    image_reference.ReferencedSOPClassUID = str(first_instance['sopClassUID'])
+    image_reference.ReferencedSOPInstanceUID = str(first_instance['sopInstanceUID'])
+    referenced_series.ContourImageSequence.append(image_reference)
+
+    # Dynamic ROI states are not a standard RTSTRUCT time dimension. Keep an
+    # explicit versioned private mapping, including completely empty states, so
+    # dRTImporter can restore this convention in its subsequent import patch.
+    temporal_map = {
+      'schemaVersion': 1,
+      'spatialMapping': 'SINGLE_SOP_ENHANCED_FRAMES',
+      'sopInstanceUID': str(first_instance['sopInstanceUID']),
+      'sourceFrameNumbers': [list(frame['sourceFrameNumbers'])
+                             for frame in pet_metadata['frames']],
+    }
+    private_block = rtstruct.private_block(0x0011, 'SlicerDynamicPET', create=True)
+    private_block.add_new(0x01, 'UT', json.dumps(temporal_map, separators=(',', ':')))
+  else:
+    # Existing temporal SOP convention is preserved byte-for-byte for classic
+    # PET and per-temporal-instance 3D PET.
+    for frame_index, frame in enumerate(pet_metadata['frames']):
+      for instance in frame.get('instances') or []:
+        image_reference = Dataset()
+        image_reference.ReferencedSOPClassUID = str(instance['sopClassUID'])
+        image_reference.ReferencedSOPInstanceUID = str(instance['sopInstanceUID'])
+        image_reference.ReferencedFrameNumber = frame_index + 1
+        referenced_series.ContourImageSequence.append(image_reference)
 
   referenced_study.RTReferencedSeriesSequence = Sequence([referenced_series])
   referenced_frame.RTReferencedStudySequence = Sequence([referenced_study])
@@ -935,15 +1142,20 @@ def _append_roi(rtstruct, roi_number, definition, geometry_states, pet_metadata)
       for frame_index in frame_indices:
         frame = pet_metadata['frames'][frame_index]
         source_instance = _reference_instance_for_contour(frame, points_lps)
+        if _is_single_sop_enhanced(pet_metadata):
+          referenced_frame_number = _enhanced_source_frame_for_contour(
+            pet_metadata, frame_index, points_lps)
+        else:
+          referenced_frame_number = frame_index + 1
         reference_key = (
-          str(source_instance['sopInstanceUID']), frame_index + 1)
+          str(source_instance['sopInstanceUID']), referenced_frame_number)
         if reference_key in seen_references:
           continue
         seen_references.add(reference_key)
         image_reference = Dataset()
         image_reference.ReferencedSOPClassUID = str(source_instance['sopClassUID'])
         image_reference.ReferencedSOPInstanceUID = str(source_instance['sopInstanceUID'])
-        image_reference.ReferencedFrameNumber = frame_index + 1
+        image_reference.ReferencedFrameNumber = referenced_frame_number
         contour.ContourImageSequence.append(image_reference)
 
       if contour.ContourImageSequence:
@@ -984,7 +1196,7 @@ def _contour_points_signature(contours):
   return digest.hexdigest()
 
 
-def _dicom_contour_signature_for_frame(roi_contour, frame_number):
+def _dicom_contour_signature_for_frame(roi_contour, frame_number, pet_metadata=None):
   """Digest ContourData belonging to one ROI temporal frame."""
   contours = []
   for contour in getattr(roi_contour, 'ContourSequence', []):
@@ -993,7 +1205,11 @@ def _dicom_contour_signature_for_frame(roi_contour, frame_number):
       for reference in getattr(contour, 'ContourImageSequence', [])
       if getattr(reference, 'ReferencedFrameNumber', None) is not None
     }
-    if int(frame_number) not in referenced_frames:
+    if _is_single_sop_enhanced(pet_metadata or {}):
+      expected_numbers = set(pet_metadata['frames'][int(frame_number) - 1]['sourceFrameNumbers'])
+      if not (referenced_frames & expected_numbers):
+        continue
+    elif int(frame_number) not in referenced_frames:
       continue
     values = [float(value) for value in getattr(contour, 'ContourData', [])]
     points = [
@@ -1013,22 +1229,43 @@ def _validate_rtstruct_in_memory(
   if str(getattr(rtstruct, 'SOPClassUID', '')) != RTSTRUCT_SOP_CLASS_UID:
     raise RuntimeError('Generated object is not an RT Structure Set.')
 
+  enhanced = _is_single_sop_enhanced(pet_metadata)
   expected_map = {
     index + 1: {str(item['sopInstanceUID']) for item in frame.get('instances') or []}
     for index, frame in enumerate(pet_metadata['frames'])
   }
   actual_map = {}
+  reverse_source_frames = {}
   try:
     series = (rtstruct.ReferencedFrameOfReferenceSequence[0]
               .RTReferencedStudySequence[0]
               .RTReferencedSeriesSequence[0])
-    for image_reference in getattr(series, 'ContourImageSequence', []):
-      frame_number = int(image_reference.ReferencedFrameNumber)
-      actual_map.setdefault(frame_number, set()).add(
-        str(image_reference.ReferencedSOPInstanceUID))
+    if enhanced:
+      original_uid = pet_metadata['frames'][0]['instances'][0]['sopInstanceUID']
+      series_references = list(getattr(series, 'ContourImageSequence', []))
+      if (len(series_references) != 1
+          or str(series_references[0].ReferencedSOPInstanceUID) != original_uid
+          or hasattr(series_references[0], 'ReferencedFrameNumber')):
+        raise RuntimeError('Enhanced RTSTRUCT series-level source UID is incorrect.')
+      private_block = rtstruct.private_block(0x0011, 'SlicerDynamicPET')
+      stored = json.loads(str(rtstruct[private_block.get_tag(0x01)].value))
+      expected_numbers = [frame['sourceFrameNumbers'] for frame in pet_metadata['frames']]
+      if (stored.get('schemaVersion') != 1
+          or stored.get('spatialMapping') != 'SINGLE_SOP_ENHANCED_FRAMES'
+          or stored.get('sopInstanceUID') != original_uid
+          or stored.get('sourceFrameNumbers') != expected_numbers):
+        raise RuntimeError('Enhanced RTSTRUCT private temporal mapping is incorrect.')
+      for temporal_index, numbers in enumerate(expected_numbers):
+        for number in numbers:
+          reverse_source_frames[int(number)] = temporal_index + 1
+    else:
+      for image_reference in getattr(series, 'ContourImageSequence', []):
+        frame_number = int(image_reference.ReferencedFrameNumber)
+        actual_map.setdefault(frame_number, set()).add(
+          str(image_reference.ReferencedSOPInstanceUID))
   except Exception as error:
-    raise RuntimeError('Generated RTSTRUCT is missing the temporal reference map.') from error
-  if actual_map != expected_map:
+    raise RuntimeError('Generated RTSTRUCT has invalid temporal source references.') from error
+  if not enhanced and actual_map != expected_map:
     raise RuntimeError('Generated RTSTRUCT failed temporal SOP-set validation.')
 
   contour_count = 0
@@ -1048,10 +1285,16 @@ def _validate_rtstruct_in_memory(
         raise RuntimeError('Generated contour has no temporal PET references.')
       referenced_frames_for_contour = set()
       for reference in references:
-        frame_number = int(reference.ReferencedFrameNumber)
+        source_frame_number = int(reference.ReferencedFrameNumber)
         uid = str(reference.ReferencedSOPInstanceUID)
-        if uid not in expected_map.get(frame_number, set()):
-          raise RuntimeError('Generated contour failed temporal PET reference validation.')
+        if enhanced:
+          frame_number = reverse_source_frames.get(source_frame_number)
+          if frame_number is None or uid not in expected_map.get(frame_number, set()):
+            raise RuntimeError('Generated contour references an unknown Enhanced PET frame.')
+        else:
+          frame_number = source_frame_number
+          if uid not in expected_map.get(frame_number, set()):
+            raise RuntimeError('Generated contour failed temporal PET reference validation.')
         referenced_frames_for_contour.add(frame_number)
       for frame_number in referenced_frames_for_contour:
         frame_counts[frame_number] = frame_counts.get(frame_number, 0) + 1
@@ -1078,7 +1321,7 @@ def _validate_rtstruct_in_memory(
         actual_roi_frame_contour_counts.get(roi_number, {}).keys())
       actual_geometry[roi_number] = {
         int(frame_number): _dicom_contour_signature_for_frame(
-          roi_contour, frame_number)
+          roi_contour, frame_number, pet_metadata)
         for frame_number in frame_numbers
       }
     normalized_expected_geometry = {
@@ -1738,6 +1981,8 @@ def export_dynamic_rtstruct(
   report(0, 'Resolving PET DICOM metadata')
   pet_metadata = _resolve_pet_reference_metadata(
     pet_sequence_node, pet_dicom_files, require_enhanced_pet)
+  if _is_single_sop_enhanced(pet_metadata):
+    _prepare_enhanced_geometry(pet_metadata, pet_sequence_node, reference_volume_node)
 
   reference_frame_uid = _reference_frame_of_reference_uid(reference_volume_node)
   pet_frame_uid = str(pet_metadata['frameOfReferenceUID'])
@@ -1782,6 +2027,10 @@ def export_dynamic_rtstruct(
         labelmap = _binary_labelmap(frame_segmentation, segment_id)
         if labelmap is None:
           continue
+        if _is_single_sop_enhanced(pet_metadata):
+          # The segmentation may have been drawn on CT or another voxel grid.
+          # Force PET-aligned contours before assigning Enhanced DICOM frames.
+          labelmap = _resample_binary_labelmap_to_enhanced_pet(labelmap, pet_metadata)
 
         signature = _labelmap_signature(labelmap)
         cache_key = (segment_id, signature)

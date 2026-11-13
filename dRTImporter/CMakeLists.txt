@@ -7,6 +7,7 @@ set(MODULE_PYTHON_SCRIPTS
   dRTImporterLib/__init__.py
   dRTImporterLib/dRTImporterPlugin.py
   dRTImporterLib/dRTExporter.py
+  dRTImporterLib/dRTEnhancedTemporal.py
 )
 
 set(MODULE_PYTHON_RESOURCES
